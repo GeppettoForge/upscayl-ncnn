@@ -1,55 +1,182 @@
 name: Sync Release Assets
 
+# Copies the latest published release (title, notes, and assets) from another
+# repository into the repository that runs this workflow.
+#
+# Source repository selection, in order:
+#   1. `source_repository`, when supplied for a manual workflow run.
+#   2. The `SYNC_SOURCE_REPOSITORY` Actions variable, in `owner/repo` format.
+#   3. The parent repository reported by GitHub when this repository is a fork.
+#
+# A fork therefore needs no source configuration. For a non-fork, create the
+# `SYNC_SOURCE_REPOSITORY` variable under:
+#   Settings > Secrets and variables > Actions > Variables
+#
+# About SYNC_TOKEN
+# ----------------
+# `SYNC_TOKEN` is an optional Actions repository secret containing a GitHub
+# personal access token (PAT). This workflow uses it to read the source release
+# and create the destination release. When the secret is absent, it falls back
+# to the short-lived `GITHUB_TOKEN` created by GitHub for this workflow run.
+#
+# The built-in token is sufficient when the source repository is public and no
+# other workflow must run in response to the newly created release. Use a PAT
+# when the source is private or when the release event must trigger another
+# workflow; events created with `GITHUB_TOKEN` normally do not start workflows.
+#
+# To create SYNC_TOKEN:
+#   1. Open GitHub profile Settings > Developer settings > Personal access
+#      tokens > Fine-grained tokens, then select Generate new token.
+#   2. Give the token access to the destination repository and grant the
+#      repository permission Contents: Read and write.
+#   3. For a private source owned by the same account or organization, also give
+#      the token access to the source repository.
+#   4. Generate and immediately copy the token. Treat it like a password.
+#   5. In the destination repository, open Settings > Secrets and variables >
+#      Actions > Secrets > New repository secret. Name it `SYNC_TOKEN`, paste
+#      the token, and save it.
+#
+# An organization may require approval before a fine-grained PAT can access its
+# repositories. If a private source and destination have different owners, use
+# a GitHub App or another credential that can access both repositories.
+#
+# References:
+#   PAT creation:
+#   https://docs.github.com/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens
+#   Actions repository secrets:
+#   https://docs.github.com/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets
+#   GITHUB_TOKEN behavior:
+#   https://docs.github.com/actions/concepts/security/github_token
+
 on:
   schedule:
-    - cron: '0 0 * * *' # Runs every midnight
-  workflow_dispatch: # Allows manual trigger
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      source_repository:
+        description: Source repository in owner/repo format (overrides the repository variable and fork parent)
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-release-assets
+  cancel-in-progress: false
 
 jobs:
   check-and-sync:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+
     steps:
-      - name: Get Latest Source Release
-        id: source_release
+      - name: Resolve source repository
+        id: source
         env:
-          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          REQUESTED_SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          CONFIGURED_SOURCE_REPOSITORY: ${{ vars.SYNC_SOURCE_REPOSITORY }}
         run: |
-          # Use gh api to guarantee a valid JSON response and avoid rate limits
-          TAG=$(gh api repos/upscayl/upscayl-ncnn/releases/latest --jq '.tag_name')
-          
-          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
-            echo "Error: Could not fetch latest tag."
+          set -euo pipefail
+
+          SOURCE_REPOSITORY="${REQUESTED_SOURCE_REPOSITORY:-$CONFIGURED_SOURCE_REPOSITORY}"
+
+          if [ -z "$SOURCE_REPOSITORY" ]; then
+            SOURCE_REPOSITORY="$(
+              gh api "repos/$GITHUB_REPOSITORY" --jq '.parent.full_name // empty'
+            )"
+          fi
+
+          if [ -z "$SOURCE_REPOSITORY" ]; then
+            echo "::error::No source repository was configured and $GITHUB_REPOSITORY is not a fork. Set the SYNC_SOURCE_REPOSITORY Actions variable to an owner/repo value."
             exit 1
           fi
-          
-          echo "latest_tag=$TAG" >> $GITHUB_OUTPUT
 
-      - name: Check if Release Exists in Fork
-        id: check_fork
-        env:
-          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
-        run: |
-          # Use gh api to check if the release exists on your fork
-          if gh api repos/${{ github.repository }}/releases/tags/${{ steps.source_release.outputs.latest_tag }} >/dev/null 2>&1; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-            echo "Release ${{ steps.source_release.outputs.latest_tag }} already exists in fork. Skipping."
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
-            echo "New release found: ${{ steps.source_release.outputs.latest_tag }}"
+          if [[ ! "$SOURCE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Source repository must use owner/repo format; got '$SOURCE_REPOSITORY'."
+            exit 1
           fi
 
-      - name: Download and Re-upload Release
-        if: steps.check_fork.outputs.exists == 'false'
+          if [ "${SOURCE_REPOSITORY,,}" = "${GITHUB_REPOSITORY,,}" ]; then
+            echo "::error::Source and destination repositories must be different."
+            exit 1
+          fi
+
+          echo "repository=$SOURCE_REPOSITORY" >> "$GITHUB_OUTPUT"
+          echo "Syncing from $SOURCE_REPOSITORY to $GITHUB_REPOSITORY"
+
+      - name: Get latest source release
+        id: source_release
         env:
-          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          SOURCE_REPOSITORY: ${{ steps.source.outputs.repository }}
         run: |
-          TAG="${{ steps.source_release.outputs.latest_tag }}"
-          
-          echo "Downloading assets from original repo..."
-          gh release download "$TAG" --repo upscayl/upscayl-ncnn --dir ./assets
-          
-          echo "Creating new release and uploading assets to fork..."
-          gh release create "$TAG" ./assets/* \
-            --repo ${{ github.repository }} \
-            --title "Release $TAG" \
-            --notes "Automated sync from upstream repository."
+          set -euo pipefail
+
+          TAG="$(
+            gh api "repos/$SOURCE_REPOSITORY/releases/latest" --jq '.tag_name // empty'
+          )"
+
+          if [ -z "$TAG" ]; then
+            echo "::error::Could not find a published release in $SOURCE_REPOSITORY."
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Check destination release
+        id: destination_release
+        env:
+          TAG: ${{ steps.source_release.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG already exists in $GITHUB_REPOSITORY; skipping."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG does not exist in $GITHUB_REPOSITORY; syncing it."
+          fi
+
+      - name: Download and re-upload release
+        if: steps.destination_release.outputs.exists == 'false'
+        env:
+          SOURCE_REPOSITORY: ${{ steps.source.outputs.repository }}
+          TAG: ${{ steps.source_release.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          ASSET_DIRECTORY="$RUNNER_TEMP/release-assets"
+          NOTES_FILE="$RUNNER_TEMP/release-notes.md"
+          mkdir -p "$ASSET_DIRECTORY"
+
+          RELEASE_TITLE="$(
+            gh api "repos/$SOURCE_REPOSITORY/releases/tags/$TAG" \
+              --jq '.name // .tag_name'
+          )"
+          gh api "repos/$SOURCE_REPOSITORY/releases/tags/$TAG" \
+            --jq '.body // ""' > "$NOTES_FILE"
+
+          ASSET_COUNT="$(
+            gh api "repos/$SOURCE_REPOSITORY/releases/tags/$TAG" \
+              --jq '.assets | length'
+          )"
+
+          ASSETS=()
+          if [ "$ASSET_COUNT" -gt 0 ]; then
+            echo "Downloading $ASSET_COUNT release asset(s) from $SOURCE_REPOSITORY..."
+            gh release download "$TAG" \
+              --repo "$SOURCE_REPOSITORY" \
+              --dir "$ASSET_DIRECTORY"
+
+            while IFS= read -r -d '' ASSET; do
+              ASSETS+=("$ASSET")
+            done < <(find "$ASSET_DIRECTORY" -maxdepth 1 -type f -print0)
+          else
+            echo "The source release has no assets; creating the release without assets."
+          fi
+
+          echo "Creating release $TAG in $GITHUB_REPOSITORY..."
+          gh release create "$TAG" "${ASSETS[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$RELEASE_TITLE" \
+            --notes-file "$NOTES_FILE"
